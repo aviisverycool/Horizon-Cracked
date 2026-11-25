@@ -4,6 +4,15 @@ on:
   push:
     tags: ['v[0-9]*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        type: string
+        default: v2.0.0
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
@@ -13,6 +22,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -29,6 +40,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -46,7 +59,6 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [windows, linux]
     runs-on: ubuntu-24.04
     permissions:
@@ -61,7 +73,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          windows="Crackrizon${GITHUB_REF_NAME#v}.exe"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          windows="Crackrizon${RELEASE_TAG#v}.exe"
           linux="Crackrizon-linux-x86_64.tar.gz"
           sha256sum "$windows" "$linux" > SHA256SUMS.txt
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
@@ -73,6 +86,6 @@ jobs:
 
           Both launchers use an existing Horizon installation. Browse, Manage, and native builds use the official `horizon-launcher` executable. Put it beside Crackrizon or set `HORIZON_LAUNCHER_EXE` to its full path. [Horizon downloads](https://playhorizon.dev/download)
           NOTES
-          gh release create "$GITHUB_REF_NAME" "$windows" "$linux" SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Crackrizon ${GITHUB_REF_NAME#v}" \
+          gh release create "$RELEASE_TAG" "$windows" "$linux" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Crackrizon ${RELEASE_TAG#v}" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
