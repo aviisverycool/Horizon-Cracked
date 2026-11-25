@@ -6,15 +6,17 @@ for _stream_name in ("stdout", "stderr"):
         setattr(sys, _stream_name, open(os.devnull, "w", encoding="utf-8"))
 
 from collections.abc import Callable
-import hashlib
 import json
 from pathlib import Path
 import queue
 import re
 import subprocess
 import threading
-import requests
-import minecraft_launcher_lib
+from game_files import GameFiles
+from launcher_log import BuildLog, process_events
+from ely_skins import cached_skin, skin_environment
+import launcher_layout as layout
+from horizon_mods import HorizonMods
 
 try:
     import flet as ft
@@ -40,21 +42,18 @@ ASSETS_DIR = Path(getattr(sys, "_MEIPASS", APP_ROOT)) / "assets"
 APP_ICON_FILE = ASSETS_DIR / "app_icon.png"
 
 # ───────────────────────────── Design tokens ─────────────────────────────
-TAGLINE = "Horizon client"          
 
-BG = "#08090E"                     
-SIDEBAR = "#0B0C12"                 
-PANEL = "#10121A"                   
-RAISED = "#171A25"                  
-LINE = "#1E2230"                  
-LINE_HI = "#2C3144"                 
-TEXT = "#EDEFF5"
-MUTED = "#8187A0"
-FAINT = "#555B73"
-ACCENT = "#8B6CFF"
-ACCENT_DEEP = "#5F42E8"
-ACCENT_SOFT = "#B7A6FF"
-DAWN = "#FFB46B"                    
+BG = "#0C0A1A"
+SIDEBAR = "#211D35"
+PANEL = "#DC28233F"
+RAISED = "#322D48"
+LINE = "#403951"
+LINE_HI = "#574F69"
+TEXT = "#FAF9FD"
+MUTED = "#C5BFD2"
+FAINT = "#B2A9BF"
+ACCENT = "#BBA5FF"
+ACCENT_SOFT = "#E4D9FF"
 OK = "#5EE3A1"
 WARN = "#F5B85C"
 DANGER = "#FF7A85"
@@ -65,8 +64,6 @@ CUSTOM_FONT_FILE = ASSETS_DIR / "Inter.ttf"          # необязательн�
 FONT = "Inter" if CUSTOM_FONT_FILE.is_file() else "sans-serif"
 MONO = "monospace"
 
-HERO_H = 340
-GROUND_H = 60
 MAX_LOG_LINES = 2000
 
 W = ft.FontWeight
@@ -103,7 +100,7 @@ class Btn(ft.Container):
     SIZES = {
         "sm": dict(h=36, px=16, fs=13, r=11, icon=16),
         "md": dict(h=42, px=20, fs=13.5, r=13, icon=18),
-        "lg": dict(h=60, px=36, fs=16, r=18, icon=22),
+        "lg": dict(h=50, px=30, fs=16, r=12, icon=22),
     }
 
     def __init__(self, label, on_click=None, *, icon=None, kind="secondary",
@@ -140,17 +137,8 @@ class Btn(ft.Container):
 
         if kind == "primary":
             if on:
-                self.gradient = ft.LinearGradient(
-                    begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1),
-                    colors=["#A892FF" if hot else ACCENT, ACCENT_DEEP],
-                )
-                self.shadow = ft.BoxShadow(
-                    blur_radius=46 if hot else 30,
-                    color=alpha(ACCENT, 0.55 if hot else 0.35),
-                    offset=ft.Offset(0, 10),
-                )
-                self.scale = 1.03 if hot else 1
-                fg = "#FFFFFF"
+                bg = "#E6DFFD" if hot else "#FFFFFF"
+                fg = "#201A2E"
             else:
                 bg, fg = RAISED, FAINT
         elif kind == "secondary":
@@ -200,45 +188,6 @@ class Btn(ft.Container):
         self._label.value = text
 
 
-class NavItem(ft.Container):
-    def __init__(self, icon, tooltip, on_click):
-        super().__init__(
-            width=48, height=48, border_radius=15, alignment=center(),
-            tooltip=tooltip, ink=True, animate=ft.Animation(200, EASE),
-        )
-        self._icon = ft.Icon(icon, size=22)
-        self.content = self._icon
-        self._cb = on_click
-        self._active = False
-        self._hot = False
-        self.on_click = lambda _e: self._cb()
-        self.on_hover = self._hovered
-        self._style()
-
-    def _style(self):
-        if self._active:
-            self.bgcolor = alpha(ACCENT, 0.16)
-            self._icon.color = ACCENT_SOFT
-        elif self._hot:
-            self.bgcolor = alpha("#FFFFFF", 0.05)
-            self._icon.color = TEXT
-        else:
-            self.bgcolor = None
-            self._icon.color = FAINT
-
-    def _hovered(self, e):
-        self._hot = str(e.data).lower() == "true"
-        self._style()
-        try:
-            self.update()
-        except Exception:
-            pass
-
-    def set_active(self, active: bool):
-        self._active = active
-        self._style()
-
-
 class WinButton(ft.Container):
     def __init__(self, icon, on_click, danger=False):
         super().__init__(
@@ -285,19 +234,23 @@ def make_field(**kwargs) -> ft.TextField:
 # ───────────────────────────── Launcher ─────────────────────────────
 class HorizonLauncher:
     def __init__(self, page: ft.Page):
+        from ely_account import ElyAccountMenu
+
         self.page = page
+        self.ely_account = ElyAccountMenu(self, launcher_config_directory())
         self.events = queue.Queue()
         self.busy = False
+        self.task_lock = threading.Lock()
         self.offline_profiles_file = launcher_config_directory() / "offline-profiles.json"
         self.current_page = None
-        self._log_buffer = []
+        self.build_log = BuildLog(MONO, MUTED, OK, DANGER)
 
         self._configure_page()
 
         try:
             self.lock = json.loads((HORIZON_DIR / "research-lock.json").read_text(encoding="utf-8"))
             self.version = self.lock["minecraft"]["version"]
-            self.java_major = self.lock["minecraft"]["java_major"]
+            self.game_files = GameFiles(HORIZON_DIR, self.lock, self.events)
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
             self._fatal(
                 "Horizon load error",
@@ -332,12 +285,11 @@ class HorizonLauncher:
         self._build_ui()
         self._show_page("home")
         self._refresh_state()
-        if self._is_prepared():
-            self._set_status("Ready to play", "ok")
-        else:
-            self._set_status("Click Prepare to download and set up the game automatically", "warn")
+        self._set_idle_status()
         self.page.update()
-        threading.Thread(target=self._event_loop, daemon=True).start()
+        self.page.on_close = lambda _: self.events.put(("close", None))
+        threading.Thread(target=process_events, args=(self,), daemon=True).start()
+        self.ely_account.restore()
 
     # ───────────── page / window ─────────────
     def _configure_page(self):
@@ -352,7 +304,7 @@ class HorizonLauncher:
         page.theme = self._make_theme()
 
         win = page.window
-        win.width, win.height = 1120, 760
+        win.width, win.height = 1200, 760
         win.min_width, win.min_height = 980, 660
         win.title_bar_hidden = True
         win.title_bar_buttons_hidden = True
@@ -395,22 +347,18 @@ class HorizonLauncher:
         def close():
             page.window.close()
 
-        return ft.Row(
-            [
-                ft.WindowDragArea(content=ft.Container(height=44), expand=True),
-                ft.Container(
-                    padding=ft.padding.only(right=10),
-                    content=ft.Row(
-                        [
-                            WinButton(ft.Icons.MINIMIZE_ROUNDED, minimize),
-                            WinButton(ft.Icons.CROP_SQUARE_ROUNDED, maximize),
-                            WinButton(ft.Icons.CLOSE_ROUNDED, close, danger=True),
-                        ],
-                        spacing=2,
-                    ),
-                ),
-            ],
-            spacing=0,
+        return ft.Container(
+            height=32, width=float("inf"), bgcolor=SIDEBAR, padding=ft.padding.only(right=10),
+            content=ft.Row([
+                ft.WindowDragArea(expand=True, content=ft.Container(height=32,
+                    padding=ft.padding.symmetric(horizontal=14), content=ft.Row([
+                        layout.horizon_mark(16), ft.Text("Crackrizon Launcher", size=12, color=MUTED)]))),
+                ft.Row([
+                    WinButton(ft.Icons.MINIMIZE_ROUNDED, minimize),
+                    WinButton(ft.Icons.CROP_SQUARE_ROUNDED, maximize),
+                    WinButton(ft.Icons.CLOSE_ROUNDED, close, danger=True),
+                ], spacing=2),
+            ], spacing=0),
         )
 
     def _fatal(self, title, message):
@@ -471,65 +419,21 @@ class HorizonLauncher:
         self.dir_picker = ft.FilePicker(on_result=self._on_directory_picked)
         self.page.overlay.append(self.dir_picker)
 
-        self.nav = {
-            "home": NavItem(ft.Icons.HOME_ROUNDED, "Home", lambda: self._go("home")),
-            "settings": NavItem(ft.Icons.SETTINGS_ROUNDED, "Settings", lambda: self._go("settings")),
-            "log": NavItem(ft.Icons.TERMINAL_ROUNDED, "Log", lambda: self._go("log")),
-        }
-        self.side_dot = ft.Container(
-            width=9, height=9, border_radius=5, bgcolor=WARN,
-            animate=ft.Animation(400, EASE),
-        )
-        logo = ft.Container(
-            width=42, height=42, border_radius=14, alignment=center(),
-            gradient=ft.LinearGradient(
-                begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1), colors=[ACCENT, DAWN],
-            ),
-            shadow=ft.BoxShadow(blur_radius=26, color=alpha(ACCENT, 0.35), offset=ft.Offset(0, 6)),
-            content=ft.Text("C", size=20, weight=W.W_700, color="#FFFFFF"),
-        )
-        sidebar = ft.Container(
-            width=78, bgcolor=SIDEBAR, padding=ft.padding.symmetric(vertical=24),
-            border=ft.border.only(right=ft.BorderSide(1, LINE)),
-            content=ft.Column(
-                [
-                    logo,
-                    ft.Container(height=22),
-                    *self.nav.values(),
-                    ft.Container(expand=True),
-                    self.side_dot,
-                    ft.Container(height=4),
-                ],
-                spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-        )
-
-        self.pages = {
-            "home": self._build_home(),
-            "settings": self._build_settings(),
-            "log": self._build_log(),
-        }
-        self.host = ft.Container(expand=True)
-        self.action_buttons = [
-            self.play_button, self.prepare_button,
-            self.sounds_button, self.download_libs_button,
-        ]
-
-        self.page.add(
-            ft.Row(
-                [
-                    sidebar,
-                    ft.Column([self._titlebar(), self.host], spacing=0, expand=True),
-                ],
-                spacing=0, expand=True, vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-            )
-        )
+        self.mods = HorizonMods(self, HORIZON_DIR)
+        frame = layout.shell(self, "horizon-dusk.png")
+        self.pages = {"home": self._build_home(), "settings": self._build_settings(),
+                      "log": self._build_log(), "components": self.components_page,
+                      "wardrobe": self.wardrobe_page, "mods": self.mods.page(),
+                      "manage": self.mods.manage_page()}
+        self.action_buttons = [self.play_button, self.prepare_button, self.sounds_button,
+                               self.download_libs_button]
+        self.page.add(frame)
 
     @staticmethod
     def _page_shell(*controls, scroll=True):
         return ft.Container(
             expand=True,
-            padding=ft.padding.only(left=44, right=44, top=2, bottom=32),
+            padding=ft.padding.only(left=2, right=4, top=2, bottom=22),
             content=ft.Column(
                 list(controls), spacing=0, expand=True,
                 scroll=ft.ScrollMode.AUTO if scroll else None,
@@ -539,7 +443,7 @@ class HorizonLauncher:
 
     @staticmethod
     def _heading(text):
-        return ft.Text(text, size=30, weight=W.W_300, color=TEXT,
+        return ft.Text(text, size=28, weight=W.W_700, color=TEXT,
                        style=ft.TextStyle(letter_spacing=-0.8))
 
     # ───────────── home ─────────────
@@ -547,29 +451,6 @@ class HorizonLauncher:
         # — hero —
         self.play_button = Btn("Play", self._play, icon=ft.Icons.PLAY_ARROW_ROUNDED,
                                kind="primary", size="lg")
-
-        self.profile_label = ft.Text(self.selected_profile, size=14.5, weight=W.W_600, color=TEXT)
-        self.profile_menu = ft.PopupMenuButton(
-            tooltip="Switch profile",
-            items=self._profile_menu_items(),
-            content=ft.Container(
-                height=60, padding=ft.padding.symmetric(horizontal=20), border_radius=18,
-                bgcolor=alpha("#FFFFFF", 0.05),
-                border=ft.border.all(1, alpha("#FFFFFF", 0.12)),
-                content=ft.Row(
-                    [
-                        ft.Icon(ft.Icons.PERSON_ROUNDED, size=20, color=ACCENT_SOFT),
-                        ft.Column(
-                            [ft.Text("Playing as", size=11, color=alpha("#FFFFFF", 0.45)),
-                             self.profile_label],
-                            spacing=0, tight=True,
-                        ),
-                        ft.Icon(ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED, size=18, color=MUTED),
-                    ],
-                    spacing=14, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            ),
-        )
 
         self.status_dot = ft.Container(
             width=8, height=8, border_radius=4, bgcolor=WARN, animate=ft.Animation(300, EASE),
@@ -580,82 +461,6 @@ class HorizonLauncher:
             value=None, height=2, color=ACCENT_SOFT, bgcolor=ft.Colors.TRANSPARENT, visible=False,
         )
 
-        def layer(**kwargs):
-            return ft.Container(left=0, right=0, top=0, bottom=0, **kwargs)
-
-        sun_glow = layer(gradient=ft.RadialGradient(
-            center=ft.Alignment(0.62, 0.62), radius=0.95,
-            colors=[alpha(DAWN, 0.50), alpha("#FF7A8A", 0.20), alpha(ACCENT, 0.08), ft.Colors.TRANSPARENT],
-            stops=[0.0, 0.34, 0.68, 1.0],
-        ))
-        violet_wash = layer(gradient=ft.RadialGradient(
-            center=ft.Alignment(-0.95, -0.2), radius=1.15,
-            colors=[alpha(ACCENT, 0.30), ft.Colors.TRANSPARENT],
-        ))
-        ground = ft.Container(
-            left=0, right=0, bottom=0, height=GROUND_H,
-            padding=ft.padding.symmetric(horizontal=44),
-            gradient=ft.LinearGradient(
-                begin=ft.Alignment(0, -1), end=ft.Alignment(0, 1),
-                colors=[alpha("#06070B", 0.78), alpha("#06070B", 0.96)],
-            ),
-            content=ft.Row(
-                [self.status_dot, ft.Container(content=self.status_text, expand=True)],
-                spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-        )
-        horizon_line = ft.Container(
-            left=0, right=0, bottom=GROUND_H, height=1,
-            gradient=ft.LinearGradient(
-                begin=ft.Alignment(-1, 0), end=ft.Alignment(1, 0),
-                colors=[ft.Colors.TRANSPARENT, alpha(ACCENT_SOFT, 0.35),
-                        alpha(DAWN, 0.85), alpha(ACCENT_SOFT, 0.25), ft.Colors.TRANSPARENT],
-                stops=[0.0, 0.25, 0.62, 0.85, 1.0],
-            ),
-        )
-        version_pill = ft.Container(
-            padding=ft.padding.symmetric(horizontal=14, vertical=7), border_radius=20,
-            bgcolor=alpha("#FFFFFF", 0.06), border=ft.border.all(1, alpha("#FFFFFF", 0.10)),
-            content=ft.Text(f"Minecraft {self.version}", size=12.5, weight=W.W_500,
-                            color=alpha("#FFFFFF", 0.75)),
-        )
-        hero_content = ft.Container(
-            left=0, right=0, top=0, bottom=GROUND_H,
-            padding=ft.padding.only(left=44, right=44, top=30, bottom=26),
-            content=ft.Column(
-                [
-                    ft.Column(
-                        [
-                            version_pill,
-                            ft.Container(height=14),
-                            ft.Text("Crackrizon", size=62, weight=W.W_200, color="#FFFFFF",
-                                    style=ft.TextStyle(letter_spacing=-2.5)),
-                            ft.Text(TAGLINE, size=15, color=alpha("#FFFFFF", 0.55)),
-                        ],
-                        spacing=0, tight=True,
-                    ),
-                    ft.Row([self.play_button, self.profile_menu], spacing=16,
-                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            ),
-        )
-        progress_layer = ft.Container(left=0, right=0, bottom=0, content=self.progress)
-
-        hero = ft.Container(
-            height=HERO_H, border_radius=26, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            border=ft.border.all(1, LINE),
-            gradient=ft.LinearGradient(
-                begin=ft.Alignment(0, -1), end=ft.Alignment(0, 1),
-                colors=["#0D0E17", "#15112A"],
-            ),
-            content=ft.Stack(
-                [sun_glow, violet_wash, ground, horizon_line, hero_content, progress_layer],
-                expand=True,
-            ),
-        )
-
-        # — components list —
         self.resources_desc = ft.Text("", size=13, color=MUTED)
         self.prepare_button = Btn("Prepare", self._prepare, size="sm")
         self.sounds_button = Btn("Add", self._prepare_sounds, size="sm")
@@ -685,19 +490,9 @@ class HorizonLauncher:
             padding=ft.padding.symmetric(vertical=6), content=rows,
         )
 
-        return self._page_shell(
-            hero,
-            ft.Container(height=30),
-            ft.Text("Components", size=16, weight=W.W_600, color=TEXT),
-            ft.Container(height=12),
-            components,
-            ft.Container(height=14),
-            ft.Text(
-                f"Minecraft {self.version} and all components are downloaded automatically — "
-                "the official client is not required.",
-                size=12.5, color=FAINT,
-            ),
-        )
+        self.components_page = self._page_shell(self._heading("Components"),
+            ft.Container(height=16), components)
+        return layout.home(self)
 
     @staticmethod
     def _component_row(icon, title, description, button):
@@ -734,7 +529,7 @@ class HorizonLauncher:
         items.append(ft.PopupMenuItem())
         items.append(ft.PopupMenuItem(
             text="Manage profiles", icon=ft.Icons.TUNE_ROUNDED,
-            on_click=lambda _e: self._go("settings"),
+            on_click=lambda _e: self._go("wardrobe"),
         ))
         return items
 
@@ -782,18 +577,15 @@ class HorizonLauncher:
         )
         self._render_profiles()
 
-        return self._page_shell(
-            self._heading("Settings"),
-            ft.Container(height=22),
-            folder_panel,
-            ft.Container(height=18),
-            profile_panel,
-        )
+        self.wardrobe_page = self._page_shell(self._heading("Wardrobe"), ft.Container(height=16),
+            self._panel("Ely.by", "Sign in to sync your player skin.", self.ely_account.controls),
+            ft.Container(height=12), profile_panel)
+        return self._page_shell(self._heading("Settings"), ft.Container(height=16), folder_panel)
 
     @staticmethod
     def _panel(title, subtitle, *body):
         return ft.Container(
-            bgcolor=PANEL, border_radius=22, border=ft.border.all(1, LINE), padding=28,
+            bgcolor=PANEL, border_radius=16, padding=22,
             content=ft.Column(
                 [
                     ft.Text(title, size=16, weight=W.W_600, color=TEXT),
@@ -822,10 +614,22 @@ class HorizonLauncher:
                 content=ft.Row(row, spacing=8, tight=True),
             ))
         self.chips_row.controls = chips
+        self._render_avatar()
         self.profile_label.value = self.selected_profile
         self.profile_menu.items = self._profile_menu_items()
         self.remove_offline_profile_button.set_label(f"Remove {self.selected_profile}")
         self.remove_offline_profile_button.set_enabled(len(self.offline_profiles) > 1)
+
+    def _render_avatar(self):
+        self.avatar.content = layout.player_avatar(cached_skin(launcher_config_directory(), self.selected_profile))
+
+    def _activate_ely_profile(self, name):
+        profiles = [name if p.casefold() == name.casefold() else p for p in self.offline_profiles]
+        if name not in profiles:
+            profiles.append(name)
+        self._write_offline_profiles(profiles, name)
+        self.offline_profiles, self.selected_profile = profiles, name
+        self._render_profiles()
 
     def _clear_profile_error(self, _e=None):
         if self.new_profile_field.error_text:
@@ -914,12 +718,11 @@ class HorizonLauncher:
 
     # ───────────── log ─────────────
     def _build_log(self):
-        self.log_view = ft.ListView(expand=True, spacing=3, auto_scroll=True)
-        self._append_log("Horizon Launcher is ready.")
+        self.build_log.append("Horizon Launcher is ready.")
 
         header = ft.Row(
             [
-                self._heading("Log"),
+                self._heading("Build log"),
                 ft.Container(expand=True),
                 Btn("Copy", self._copy_log, icon=ft.Icons.CONTENT_COPY_ROUNDED,
                     kind="ghost", size="sm"),
@@ -929,45 +732,44 @@ class HorizonLauncher:
             spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         panel = ft.Container(
-            expand=True, bgcolor="#090A0F", border_radius=22, border=ft.border.all(1, LINE),
+            expand=True, bgcolor="#DE201C33", border_radius=15, border=ft.border.all(1, LINE),
             padding=ft.padding.symmetric(horizontal=22, vertical=18),
-            content=self.log_view,
+            content=self.build_log.view,
         )
         return self._page_shell(header, ft.Container(height=18), panel, scroll=False)
 
-    def _append_log(self, text, tag=None):
-        color = {"success": OK, "error": DANGER}.get(tag, MUTED)
-        self.log_view.controls.append(
-            ft.Text(text, size=12, color=color, font_family=MONO, selectable=True)
-        )
-        self._log_buffer.append(text)
-        overflow = len(self.log_view.controls) - MAX_LOG_LINES
-        if overflow > 0:
-            del self.log_view.controls[:overflow]
-            del self._log_buffer[:overflow]
-
     def _copy_log(self):
-        self.page.set_clipboard("\n".join(self._log_buffer))
+        self.page.set_clipboard(self.build_log.text())
         self.page.open(ft.SnackBar(
             content=ft.Text("Log copied to clipboard", color=TEXT, size=13),
             bgcolor=RAISED, duration=1800,
         ))
 
     def _clear_log(self):
-        self.log_view.controls.clear()
-        self._log_buffer.clear()
+        self.build_log.clear()
         self.page.update()
 
     # ───────────── navigation / state ─────────────
     def _go(self, key):
+        if key == self.current_page:
+            return
         self._show_page(key)
         self.page.update()
+        if key in ("mods", "manage"):
+            if self.busy:
+                self.pending_content_page = key
+            elif key == "mods":
+                self.mods.search()
+            else:
+                self.mods.installed()
 
     def _show_page(self, key):
         self.current_page = key
+        if key == "log":
+            self.build_log.render()
         self.host.content = self.pages[key]
         for name, item in self.nav.items():
-            item.set_active(name == key)
+            item.bgcolor = layout.SOFT if name == key else None
 
     def _set_status(self, text, tone="ok"):
         color = TONES[tone]
@@ -975,7 +777,14 @@ class HorizonLauncher:
         self.status_text.color = color if tone in ("warn", "danger") else TEXT
         self.status_dot.bgcolor = color
 
+    def _set_idle_status(self):
+        if self._is_prepared():
+            self._set_status("Ready to play")
+        else:
+            self._set_status("Use Install and play to prepare this instance", "warn")
+
     def _refresh_state(self):
+        self.mods.set_busy(self.busy)
         prepared = self._is_prepared()
         if self.busy:
             label, color = "Working…", ACCENT_SOFT
@@ -996,121 +805,20 @@ class HorizonLauncher:
 
     # ───────────── backend (без изменений) ─────────────
     def _selected_paths(self):
-        minecraft_dir = Path(self.minecraft_field.value.strip()).expanduser()
+        value = (self.minecraft_field.value or "").strip()
+        if not value:
+            raise ValueError("Choose a Minecraft directory in Settings.")
+        minecraft_dir = Path(value).expanduser()
         minecraft_dir.mkdir(parents=True, exist_ok=True)
         return minecraft_dir.resolve()
 
-    def _download_file(self, url: str, dest: Path, timeout: int = 300) -> None:
-        try:
-            response = requests.get(url, timeout=timeout, stream=True)
-            response.raise_for_status()
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            self.events.put(("log_success", f"Downloaded: {dest.name}"))
-        except requests.exceptions.Timeout:
-            raise TimeoutError("Request timed out. Please try again.")
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Download error: {e}")
-
-    def _download_verified(self, key: str, title: str, dest: Path) -> None:
-        url = self.lock[key]["url"]
-        expected = self.lock[key]["sha256"]
-        self.events.put(("log", f"Downloading {title} {self.lock[key]['version']}..."))
-        self._download_file(url, dest)
-
-        sha = hashlib.sha256()
-        with open(dest, "rb") as f:
-            for block in iter(lambda: f.read(1024 * 1024), b""):
-                sha.update(block)
-        actual = sha.hexdigest()
-        if actual != expected:
-            dest.unlink(missing_ok=True)
-            raise RuntimeError(f"Hash mismatch for {title}. Expected: {expected}, got: {actual}")
-        self.events.put(("log_success", f"{title} downloaded and verified."))
-
-    def _download_vineflower(self, dest: Path) -> None:
-        self._download_verified("vineflower", "Vineflower", dest)
-
-    def _download_jadx(self, dest: Path) -> None:
-        self._download_verified("jadx_headless_mcp", "Jadx", dest)
-
-    def _minecraft_manifest_url(self):
-        manifest_sha1 = self.lock["minecraft"]["manifest_sha1"]
-        return (
-            "https://piston-meta.mojang.com/v1/packages/"
-            f"{manifest_sha1}/{self.version}.json"
-        )
-
-    def _check_or_java(self, minecraft_dir: Path) -> None:
-        version_json = minecraft_dir / "versions" / self.version / f"{self.version}.json"
-        if not version_json.is_file():
-            version_json.parent.mkdir(parents=True, exist_ok=True)
-            self._download_file(self._minecraft_manifest_url(), version_json)
-
-        try:
-            version_data = json.loads(version_json.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"Could not read Minecraft version manifest: {error}") from error
-
-        minecraft_lock = self.lock["minecraft"]
-        accepted_hashes = {
-            minecraft_lock["manifest_sha1"],
-            *minecraft_lock.get("accepted_manifest_sha1", []),
-        }
-        actual_hash = hashlib.sha1(version_json.read_bytes()).hexdigest()
-        if actual_hash not in accepted_hashes:
-            raise RuntimeError(
-                f"Unexpected Minecraft version manifest hash: {actual_hash}"
-            )
-
-        java_version = version_data.get("javaVersion")
-        if not isinstance(java_version, dict):
-            raise RuntimeError("Minecraft version manifest does not declare a Java runtime.")
-        if java_version.get("majorVersion") != self.java_major:
-            raise RuntimeError(
-                f"Minecraft requires Java {self.java_major}, but its version manifest "
-                f"declares Java {java_version.get('majorVersion')}."
-            )
-        component = java_version.get("component")
-        if not isinstance(component, str) or not component:
-            raise RuntimeError("Minecraft version manifest has no Java runtime component.")
-
-        self.events.put(("log", f"Installing Minecraft Java runtime {component}..."))
-        callbacks = {
-            "setStatus": lambda status: self.events.put(("log", f"[{status}]")),
-            "setProgress": lambda _progress: None,
-            "setMax": lambda _maximum: None,
-        }
-        minecraft_launcher_lib.runtime.install_jvm_runtime(
-            component, minecraft_dir, callback=callbacks,
-        )
-
-    def _check_or_download_vineflower(self) -> Path:
-        dest = HORIZON_DIR / ".local" / "vineflower" / "vineflower.jar"
-        if not dest.exists():
-            self._download_vineflower(dest)
-        return dest
-
-    def _check_or_download_jadx(self) -> Path:
-        dest = HORIZON_DIR / ".local" / "jadx" / "jadx-headless-mcp.jar"
-        if not dest.exists():
-            self._download_jadx(dest)
-        return dest
-
     def _download_all_libs(self):
-        minecraft_dir = self._selected_paths()
-
         def task():
-            self.events.put(("status", "Downloading libraries..."))
-            self._check_or_download_vineflower()
-            self._check_or_download_jadx()
-            self._check_or_java(minecraft_dir)
-            self.events.put(("status", "All libraries downloaded"))
-            self.events.put(("log_success", "Ready to launch."))
+            self.game_files.install_libraries(self._selected_paths())
+            self.events.put(("status", "Libraries ready"))
+            self.events.put(("log_success", "Libraries verified."))
 
-        self._start_task(task)
+        self._start_task(task, "Checking libraries…")
 
     def _is_prepared(self):
         return (self.resources_dir / "horizon-resources.json").is_file()
@@ -1118,37 +826,42 @@ class HorizonLauncher:
     def _play(self):
         player_name = self.selected_profile
         if self._is_prepared():
-            self._start_task(lambda: self._launch_client(player_name))
+            self._start_task(lambda: self._launch_client(player_name), "Starting Horizon…")
             return
 
-        minecraft_dir = self._selected_paths()
-        self._start_task(
-            lambda: self._prepare_resources(minecraft_dir, launch=True, player_name=player_name)
-        )
+        self._start_task(lambda: self._prepare_resources(self._selected_paths(), launch=True,
+                                                         player_name=player_name), "Preparing game files…")
 
     def _prepare(self):
-        minecraft_dir = self._selected_paths()
-        self._start_task(
-            lambda: self._prepare_resources(minecraft_dir, launch=False)
-        )
+        self._start_task(lambda: self._prepare_resources(self._selected_paths(), launch=False),
+                         "Preparing game files…")
 
     def _prepare_sounds(self):
         if not self._is_prepared():
             self._alert("Resources not prepared", "Please click Play or Prepare first.")
             return
-        minecraft_dir = self._selected_paths()
-        self._start_task(lambda: self._copy_sounds(minecraft_dir))
+        self._start_task(lambda: self._copy_sounds(self._selected_paths()), "Adding sounds…")
 
-    def _start_task(self, task: Callable[[], None]) -> None:
-        if self.busy:
+    def _start_task(self, task: Callable[[], None], status="Working…") -> None:
+        if not self.task_lock.acquire(blocking=False):
             return
         self.busy = True
-        for button in self.action_buttons:
-            button.set_enabled(False)
-        self._set_status("Preparing...", "accent")
-        self._refresh_state()
-        self.page.update()
-        threading.Thread(target=self._run_task, args=(task,), daemon=True).start()
+        self.task_status = status
+        try:
+            for button in self.action_buttons:
+                button.set_enabled(False)
+            self._set_status(status, "accent")
+            self._refresh_state()
+            self.page.update()
+            threading.Thread(target=self._run_task, args=(task,), daemon=True).start()
+        except Exception:
+            self.busy = False
+            self.task_lock.release()
+            for button in self.action_buttons:
+                button.set_enabled(True)
+            self._refresh_state()
+            self._set_idle_status()
+            raise
 
     def _run_task(self, task):
         try:
@@ -1157,53 +870,6 @@ class HorizonLauncher:
             self.events.put(("error", str(error)))
         finally:
             self.events.put(("done", None))
-
-    def _ensure_minecraft_and_server(self, minecraft_dir: Path) -> Path:
-        self.events.put(("log", f"Checking for Minecraft {self.version}..."))
-
-        version_dir = minecraft_dir / "versions" / self.version
-        version_jar = version_dir / f"{self.version}.jar"
-        version_json = version_dir / f"{self.version}.json"
-
-        if not version_jar.is_file() or not version_json.is_file():
-            self.events.put(("log", f"Minecraft {self.version} files missing. Downloading via launcher library..."))
-            version_dir.mkdir(parents=True, exist_ok=True)
-
-            cbs = {
-                "setStatus": lambda t: self.events.put(("log", f"[{t}]")),
-                "setProgress": lambda v: None,
-                "setMax": lambda v: None
-            }
-
-            minecraft_launcher_lib.install.install_minecraft_version(self.version, minecraft_dir, callback=cbs)
-
-
-            self.events.put(("log", f"Applying required Horizon manifest for {self.version}..."))
-            if version_json.is_file():
-                version_json.unlink()
-            self._download_file(self._minecraft_manifest_url(), version_json)
-
-            self.events.put(("log_success", f"Minecraft {self.version} setup complete!"))
-        else:
-            self.events.put(("log", f"Minecraft {self.version} is already installed."))
-
-        server_jar_dir = HORIZON_DIR / ".local" / "minecraft" / self.version / "jars"
-        server_jar = server_jar_dir / "server.jar"
-        if not server_jar.is_file():
-            self.events.put(("log", f"Downloading server.jar for version {self.version}..."))
-            try:
-                manifest_url = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
-                manifest = requests.get(manifest_url, timeout=30).json()
-                version_url = next((v["url"] for v in manifest["versions"] if v["id"] == self.version), None)
-                if version_url:
-                    v_data = requests.get(version_url, timeout=30).json()
-                    server_url = v_data.get("downloads", {}).get("server", {}).get("url")
-                    if server_url:
-                        self._download_file(server_url, server_jar)
-            except Exception as e:
-                raise RuntimeError(f"Failed to automatically download server.jar: {e}")
-
-        return server_jar
 
     @staticmethod
     def _require_executable(path: Path) -> Path:
@@ -1217,8 +883,8 @@ class HorizonLauncher:
         return path
 
     def _prepare_resources(self, minecraft_dir, launch, player_name=None):
-        server_jar = self._ensure_minecraft_and_server(minecraft_dir)
-        self._check_or_java(minecraft_dir)
+        server_jar = self.game_files.ensure_minecraft(minecraft_dir)
+        self.game_files.ensure_java(minecraft_dir)
 
         preparer = self._require_executable(HORIZON_DIR / "horizon-prepare")
 
@@ -1269,9 +935,12 @@ class HorizonLauncher:
         if not self._is_prepared():
             raise RuntimeError("Please prepare Horizon resources first.")
 
-        command = [str(client), "--resources", str(self.resources_dir), "--name", player_name]
+        client, resources = self.mods.launch_paths(client, self.resources_dir)
+        self.mods.disable_java_mods()
+        command = [str(client), "--resources", str(resources), "--name", player_name]
         process = subprocess.Popen(
             command, cwd=HORIZON_DIR,
+            env=skin_environment(launcher_config_directory(), player_name),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
@@ -1290,51 +959,40 @@ class HorizonLauncher:
             self.events.put(("status", "Game closed"))
 
     # ───────────── event pump ─────────────
-    def _event_loop(self):
-        """Забирает события из фоновых потоков и обновляет UI пачками."""
-        while True:
-            try:
-                batch = [self.events.get(timeout=0.2)]
-            except queue.Empty:
-                continue
-            while True:
-                try:
-                    batch.append(self.events.get_nowait())
-                except queue.Empty:
-                    break
-
-            for event, value in batch:
-                try:
-                    self._handle_event(event, value)
-                except Exception as error:  
-                    self._append_log(f"UI error: {error}", "error")
-            try:
-                self.page.update()
-            except Exception:
-                pass
-
     def _handle_event(self, event, value):
-        if event == "log":
+        if event == "ui":
+            value()
+        elif event == "log":
             if value:
-                self._append_log(value)
+                self.build_log.append(value)
         elif event == "log_success":
-            self._append_log(value, "success")
+            self.build_log.append(value, "success")
         elif event == "status":
             self._set_status(value, "ok")
         elif event == "error":
             self._set_status("Action failed", "danger")
-            self._append_log(value, "error")
+            self.build_log.append(value, "error")
             self._show_page("log")
             self._alert("Horizon error", value)
         elif event == "client_error":
             self._set_status(f"Game exited with code {value}", "danger")
-            self._append_log(f"Client finished with code {value}.", "error")
+            self.build_log.append(f"Client finished with code {value}.", "error")
             self._show_page("log")
         elif event == "done":
             self.busy = False
             for button in self.action_buttons:
                 button.set_enabled(True)
             self._refresh_state()
+            if self.status_text.value == self.task_status:
+                self._set_idle_status()
+            self.task_lock.release()
+            pending = getattr(self, "pending_content_page", None)
+            self.pending_content_page = None
+            if pending and pending == self.current_page:
+                if pending == "mods":
+                    self.mods.search()
+                else:
+                    self.mods.installed()
 
 
 def main(page: ft.Page):

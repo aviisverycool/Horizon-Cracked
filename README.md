@@ -23,18 +23,14 @@
 
 ## Getting Started
 
-### Prerequisites
-
-* **Python:** 3.13 or higher
-* **OS:** Windows 10/11 (64-bit) or Linux x86_64
-
 ### Installation
 
-* **Windows:** Install the release zip, unzip it, and launch `Crackrizon.exe`.
-* **Linux x86_64:** Extract the Linux release archive and run
-  `./Crackrizon` from the extracted folder. 
-  If launcher didnt start by it self try install depencies with `sudo apt install libgtk-3-0t64 libmpv2`; on Ubuntu, use
-  `sudo apt install libgtk-3-0 libmpv2`. 
+Download the launcher for your platform from [GitHub Releases](https://github.com/aviisverycool/Horizon-Cracked/releases).
+
+* **Windows x64** — Put `Crackrizon2.0.0.exe` beside your `horizon-windows-x64` folder and open it.
+* **Linux x86_64** — Extract `Crackrizon-linux-x86_64.tar.gz` beside your `horizon-linux-x86_64` folder and run `./Crackrizon`. On Ubuntu 24.04, install the desktop libraries with `sudo apt install libgtk-3-0t64 libmpv2` if needed.
+
+Browse, Manage, and native builds use the official `horizon-launcher` executable (`horizon-launcher.exe` on Windows). Place it beside Crackrizon or set `HORIZON_LAUNCHER_EXE` to its full path. [Horizon downloads](https://playhorizon.dev/download)
 
 https://github.com/horizon-rust/horizon - - original repository of Horizon dev
 If you want to use this please go to original horizon-rust repo and star it

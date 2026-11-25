@@ -9,6 +9,12 @@ DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist/linux}"
 WORK_DIR="${WORK_DIR:-$ROOT_DIR/build/linux}"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv-linux-build}"
 
+case "${1:-}" in
+    "") bundle_game=true ;;
+    --launcher-only) bundle_game=false ;;
+    *) echo "Usage: bash build_linux.sh [--launcher-only]" >&2; exit 2 ;;
+esac
+
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
     echo "Build this launcher on Linux x86_64." >&2
     exit 1
@@ -29,12 +35,14 @@ if [[ ! -f "$SOURCE_FILE" || ! -f "$ASSETS_DIR/app_icon.png" ]]; then
     exit 1
 fi
 
-for executable in horizon-client horizon-prepare horizon-ctl horizon-server; do
-    if [[ ! -f "$HORIZON_DIR/$executable" ]]; then
-        echo "Missing Linux Horizon executable: $HORIZON_DIR/$executable" >&2
-        exit 1
-    fi
-done
+if [[ "$bundle_game" == true ]]; then
+    for executable in horizon-client horizon-prepare horizon-ctl horizon-server; do
+        if [[ ! -f "$HORIZON_DIR/$executable" ]]; then
+            echo "Missing Linux Horizon executable: $HORIZON_DIR/$executable" >&2
+            exit 1
+        fi
+    done
+fi
 
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
@@ -56,9 +64,14 @@ mkdir -p "$DIST_DIR"
     --specpath "$WORK_DIR" \
     "$SOURCE_FILE"
 
+chmod +x "$DIST_DIR/Crackrizon"
+if [[ "$bundle_game" == false ]]; then
+    echo "Linux launcher ready: $DIST_DIR/Crackrizon"
+    exit 0
+fi
+
 mkdir -p "$DIST_DIR/horizon-linux-x86_64"
 cp -a "$HORIZON_DIR/." "$DIST_DIR/horizon-linux-x86_64/"
-chmod +x "$DIST_DIR/Crackrizon"
 chmod +x "$DIST_DIR/horizon-linux-x86_64"/horizon-client \
     "$DIST_DIR/horizon-linux-x86_64"/horizon-prepare \
     "$DIST_DIR/horizon-linux-x86_64"/horizon-ctl \

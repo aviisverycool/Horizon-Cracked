@@ -1,0 +1,78 @@
+name: Build launcher release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-linux-build.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python -m PyInstaller --noconfirm launcher.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/Crackrizon*.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: bash build_linux.sh --launcher-only
+      - run: .venv-linux-build/bin/python -m unittest discover -s tests -v
+      - name: Package the Linux executable
+        run: |
+          file dist/linux/Crackrizon | grep -q 'ELF 64-bit.*x86-64'
+          tar -czf dist/Crackrizon-linux-x86_64.tar.gz -C dist/linux Crackrizon
+          tar -tzf dist/Crackrizon-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/Crackrizon-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish the verified builds
+        working-directory: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          windows="Crackrizon${GITHUB_REF_NAME#v}.exe"
+          linux="Crackrizon-linux-x86_64.tar.gz"
+          sha256sum "$windows" "$linux" > SHA256SUMS.txt
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          ## Installation
+
+          **Windows x64** — Download the `.exe` and put it beside your `horizon-windows-x64` folder.
+
+          **Linux x86_64** — Extract the `.tar.gz` beside your `horizon-linux-x86_64` folder and run `./Crackrizon`.
+
+          Both launchers use an existing Horizon installation. Browse, Manage, and native builds use the official `horizon-launcher` executable. Put it beside Crackrizon or set `HORIZON_LAUNCHER_EXE` to its full path. [Horizon downloads](https://playhorizon.dev/download)
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "$windows" "$linux" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Crackrizon ${GITHUB_REF_NAME#v}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

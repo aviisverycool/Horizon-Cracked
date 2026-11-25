@@ -1,12 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata, get_package_paths
 
 
 a = Analysis(
-    ['launcher.pyw'],
+    ['launcher win.pyw'],
     pathex=[],
     binaries=[],
-    datas=[('assets/app_icon.ico', 'assets')],
-    hiddenimports=[],
+    datas=[
+        ('assets/app_icon.ico', 'assets'),
+        ('assets/horizon-dusk.png', 'assets'),
+        (str(Path(get_package_paths('flet_desktop')[1]) / 'app'), 'flet_desktop/app'),
+        *collect_data_files('minecraft_launcher_lib'),
+        *copy_metadata('flet-desktop'),
+    ],
+    hiddenimports=['flet_desktop'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Crackrizon',
+    name='Crackrizon2.0.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
